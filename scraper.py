@@ -4,11 +4,12 @@ import pandas as pd
 import time
 
 def extract_label(url):
-    try:
-        parts = url.split("/")
-        return parts[3]  # foxnews.com/<label>/...
-    except:
-        return "unknown"
+    url = url.lower()
+    if "foxnews.com" in url:
+        return "fox"
+    if "nbcnews.com" in url:
+        return "nbc"
+    return "unknown"
 
 def extract_headline(url):
     try:
