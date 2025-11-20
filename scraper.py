@@ -48,13 +48,13 @@ def scrape_urls(input_path, output_path):
 
     for index, row in df.iterrows():
         url = row["url"]
-        print(f"[{index+1}/{total}] Fetching:", url)
+        #print(f"[{index+1}/{total}] Fetching:", url)
 
         headline = extract_headline(url)
         label = extract_label(url)
 
-        print("  headline:", headline)
-        print("  label:", label)
+        #print("  headline:", headline)
+        #print("  label:", label)
 
         results.append({
             "url": url,
