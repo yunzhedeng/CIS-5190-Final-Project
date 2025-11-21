@@ -22,3 +22,12 @@ y_pred = model.predict(X_test)
 
 print("Accuracy:", accuracy_score(y_test, y_pred))
 print("Classification Report:\n", classification_report(y_test, y_pred))
+
+submission = pd.DataFrame({
+    "id": range(len(X_test)),
+    "headline": X_test, 
+    "label": y_pred
+})
+
+submission.to_csv("submission.csv", index=False)
+print("submission.csv created.")
