@@ -78,7 +78,7 @@ def scrape_nbc_archive():
                     all_articles.append({
                         "url": full_url,
                         "headline": headline,
-                        "source": source_name
+                        "label": source_name
                     })
                     article_count_for_month += 1
                         

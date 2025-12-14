@@ -11,7 +11,7 @@ def merge_csv_files(input_files: list, output_file: str):
     all_merged_data = []
     
     # Define the common column names for the output file
-    fieldnames = ['url', 'headline', 'source']
+    fieldnames = ['url', 'headline', 'label']
     
     print("--- Starting Data Merging Process ---")
 
