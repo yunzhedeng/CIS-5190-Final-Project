@@ -1,2 +1,3 @@
-*.pem
-*.pem
+.venv/
+__pycache__/
+*.log
