@@ -4,8 +4,8 @@ import time
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AdamW
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from torch.optim import AdamW
 from preprocess import prepare_data
 
 # labels must match your model.py
