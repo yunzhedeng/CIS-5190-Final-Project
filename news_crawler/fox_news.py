@@ -14,41 +14,44 @@ FOX_HOME = "https://www.foxnews.com/"
 FOX_HOST = "foxnews.com"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
 }
 
-SLEEP_S = 0.2
-MAX_PAGES = 10         # 翻页安全上限（?page=N）
-MAX_SHOWMORE_STEPS = 60  # show more 安全上限（from += size）
+SLEEP_S = 0.3          # Slightly increased sleep to be polite
+MAX_PAGES = 10         # Safety limit for pagination crawl (?page=N)
+MAX_SHOWMORE_STEPS = 60  # Safety limit for API-based crawl (from += size)
 
 OUT_CSV = "fox_articles.csv"
 
-# Show More only for these two categories
+# Categories that require API-based "Show More" crawling instead of standard pagination.
+# These pages load content dynamically via JavaScript and an internal API.
 SHOW_MORE_CATEGORIES = {
     "https://www.foxnews.com/category/us/campus-radicals",
     "https://www.foxnews.com/category/us/immigration",
 }
 
-# Fox "Show More" API
+# Fox internal API endpoint for fetching additional articles ("Show More" button functionality).
 ARTICLE_SEARCH_API = "https://www.foxnews.com/api/article-search"
 
-# 1) Strong article signal: URLs containing /YYYY/MM/DD/
+# 1) Strong article signal: URLs containing date patterns like /YYYY/MM/DD/.
 DATE_PATH_RE = re.compile(r"/\d{4}/\d{2}/\d{2}/")
 
-# 2) Explicitly excluded non-article paths
+# 2) Prefixes of URL paths to explicitly exclude, as they are not standard text articles.
 BAD_PATH_PREFIXES = (
     "/shows/", "/games/", "/person/", "/story/", "/deals/",
     "/category/", "/topic/", "/elections/", "/live-news/", "/live/",
-    "/podcasts/", "/watch/"
+    "/podcasts/", "/watch/", "/video/"
 )
 
-# Substrings indicating external or unwanted Fox properties
+# Substrings indicating external, affiliated, or non-news Fox properties to avoid.
 BAD_SUBSTRINGS = (
     "foxnation", "outkick", "radio.foxnews.com", "foxweather.com", "foxbusiness.com",
 )
 
-# For extracting tag value used by /api/article-search (from HTML state)
+# Regex to extract the specific 'tag' value required by the /api/article-search endpoint.
+# This value is typically embedded within a JSON object in the category page's HTML source.
 TAG_FROM_OFFSETDATA_RE = re.compile(
     r'offsetData"\s*:\s*\{\s*"(?P<tag>fox-news/[^"]+)"\s*:\s*\d+\s*\}'
 )
@@ -63,72 +66,93 @@ def normalize_url(url: str) -> str:
     return url.split("#")[0].rstrip("/")
 
 def normalize_category_url(url: str) -> str:
-    """Normalize category URL for matching show-more list."""
+    """Normalize category URLs for consistent matching against SHOW_MORE_CATEGORIES."""
     return url.split("#")[0].rstrip("/")
 
 def is_good_article(url: str) -> bool:
-    """Determine whether a URL corresponds to a Fox News article page."""
-    u = urlparse(url)
+    """
+    Determine whether a given URL likely corresponds to a valid Fox News text article.
+    Checks hostname, excluded substrings, date patterns, path prefixes, depth, and slug length.
+    """
+    try:
+        u = urlparse(url)
+    except ValueError:
+        return False
+
     host = (u.netloc or "").lower().replace("www.", "")
     path = (u.path or "").lower()
 
+    # Ensure the article belongs to the main Fox News domain.
     if host != FOX_HOST:
         return False
 
-    full = url.lower()
-    if any(s in full for s in BAD_SUBSTRINGS):
+    full_url_lower = url.lower()
+    if any(s in full_url_lower for s in BAD_SUBSTRINGS):
         return False
 
-    # Strong signal: Date path exists
+    # Strong signal: Presence of a date structure in the URL path.
     if DATE_PATH_RE.search(path):
         return True
 
-    # Exclude known non-article paths
+    # Exclude known non-article sections based on path prefixes.
     if any(path.startswith(p) for p in BAD_PATH_PREFIXES):
         return False
 
-    # Exclude too-shallow paths
-    if path.count("/") <= 1:
-        return False
+    # Exclude paths that are too shallow (likely section hubs, not articles).
+    # e.g., /us/ or /politics/ instead of /us/article-slug.
+    if path.count("/") <= 2 and not path.endswith(".html"): # Slightly relaxed check
+         # Basic check: must have at least /section/slug
+         parts = [p for p in path.split("/") if p]
+         if len(parts) < 2:
+             return False
 
-    # Slug length heuristic
-    last = path.strip("/").split("/")[-1]
-    if len(last) < 12:
+    # Heuristic check on the slug length to filter out short, non-article URLs.
+    last_segment = path.strip("/").split("/")[-1]
+    if len(last_segment) < 10: # Slightly lowered threshold
         return False
 
     return True
 
 # =========================
-# Phase 1: discover nav links
+# Phase 1: Discover Navigation Links
 # =========================
 def fetch_nav_links(home_url: str = FOX_HOME, headers: dict = HEADERS) -> dict:
     """
-    Fetch all URLs found in the main navigation bar (including dropdowns).
-    Returns: {nav_text: full_url}
+    Fetch and parse the homepage to discover URLs found in the main navigation bar.
+    Returns a dictionary mapping navigation text to its normalized full URL.
     """
     print("--- Phase 1: Discovering Navigation Links ---")
     try:
-        r = requests.get(home_url, headers=headers, timeout=20)
+        r = requests.get(home_url, headers=headers, timeout=10)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
     except requests.exceptions.RequestException as e:
         print(f"Error fetching homepage during discovery: {e}")
         return {}
 
+    # Locate the primary navigation container. Selector might need adjustments if site updates.
     nav_container = soup.select_one(".nav-row-upper .primary-nav ul")
     if not nav_container:
-        print("Error: Failed to locate the primary navigation list (ul inside .primary-nav).")
-        return {}
+        print("Warning: Could not locate primary navigation list (ul inside .primary-nav). Trying fallback...")
+        # Fallback: Try a broader selector if specific one fails
+        nav_container = soup.select_one("nav.primary-nav ul")
+        if not nav_container:
+             print("Error: Failed to locate navigation container even with fallback.")
+             return {}
 
     links = {}
-    for a in nav_container.select("a[href]"):
-        href = (a.get("href") or "").strip()
-        text = a.get_text(" ", strip=True)
-        if not href or not text or len(text) < 3:
+    for a_tag in nav_container.select("a[href]"):
+        href = (a_tag.get("href") or "").strip()
+        text = a_tag.get_text(" ", strip=True)
+
+        # Filter out empty links or extremely short text labels.
+        if not href or not text or len(text) < 2:
             continue
 
         full_url = urljoin(home_url, href)
         u = urlparse(full_url)
+
+        # Ensure links point to internal Fox News pages.
         if FOX_HOST not in (u.netloc or "").lower().replace("www.", ""):
             continue
 
@@ -138,216 +162,284 @@ def fetch_nav_links(home_url: str = FOX_HOME, headers: dict = HEADERS) -> dict:
     return links
 
 # =========================
-# Phase 2A: normal paging crawl (?page=N)
+# Phase 2A: Standard Pagination Crawl (?page=N)
 # =========================
 def deep_crawl_category_with_pagination(base_url: str, rows: list, seen_urls: set, max_pages: int = MAX_PAGES):
     """
-    Visits a category/topic page and continues to crawl through pages using ?page=N.
-    Saves only {url,label}.
+    Crawls a category page using standard pagination parameters (?page=1, ?page=2, ...).
+    Extracts valid article URLs and appends them to the 'rows' list.
     """
     page = 1
-    print(f"-> Starting Paging Crawl: {base_url}")
+    print(f"-> Starting Pagination Crawl: {base_url}")
 
-    while page <= max_pages:
-        current_url = base_url if page == 1 else f"{base_url}?page={page}"
+    # Use a session for connection pooling
+    with requests.Session() as session:
+        session.headers.update(HEADERS)
 
-        try:
-            r = requests.get(current_url, headers=HEADERS, timeout=20)
-            if r.status_code == 404:
+        while page <= max_pages:
+            current_url = base_url if page == 1 else f"{base_url}?page={page}"
+
+            try:
+                r = session.get(current_url, timeout=15)
+                if r.status_code == 404:
+                    print(f"   -> Page {page} not found (404). Stopping.")
+                    break
+                r.raise_for_status() # Raise exception for other bad status codes
+
+                soup = BeautifulSoup(r.text, "html.parser")
+                new_articles_on_page = 0
+
+                # Find all links on the page
+                for a_tag in soup.select("a[href]"):
+                    href = (a_tag.get("href") or "").strip()
+                    if not href:
+                        continue
+
+                    article_url = normalize_url(urljoin(FOX_HOME, href))
+
+                    if is_good_article(article_url) and article_url not in seen_urls:
+                        seen_urls.add(article_url)
+                        rows.append({"url": article_url, "label": "fox"})
+                        new_articles_on_page += 1
+
+                # Stop if a non-first page yields no new unique articles.
+                if page > 1 and new_articles_on_page == 0:
+                    print(f"   -> No new articles found on page {page}. Stopping pagination.")
+                    break
+
+                print(f"   -> Page {page}: Found {new_articles_on_page} new article URLs.")
+                page += 1
+                time.sleep(SLEEP_S)
+
+            except requests.exceptions.RequestException as e:
+                print(f"   -> Error fetching {current_url}: {e}. Stopping pagination for this category.")
                 break
-            if r.status_code != 200:
+            except Exception as e:
+                print(f"   -> Unexpected error on page {page}: {e}. Stopping.")
                 break
 
-            soup = BeautifulSoup(r.text, "html.parser")
-            new_on_page = 0
-
-            for a in soup.select("a[href]"):
-                href = (a.get("href") or "").strip()
-                if not href:
-                    continue
-
-                article_url = normalize_url(urljoin(FOX_HOME, href))
-
-                if is_good_article(article_url) and article_url not in seen_urls:
-                    seen_urls.add(article_url)
-                    rows.append({"url": article_url, "label": "fox"})
-                    new_on_page += 1
-
-            if page > 1 and new_on_page == 0:
-                break
-
-            print(f"   -> Page {page} found {new_on_page} new article URLs.")
-            page += 1
-            time.sleep(SLEEP_S)
-
-        except requests.exceptions.RequestException as e:
-            print(f"   -> Stopping: Error fetching {current_url} - {e}")
-            break
-        except Exception as e:
-            print(f"   -> Stopping: Unexpected error - {e}")
-            break
-
-    print(f"-> Finished paging crawl for {base_url} after {page-1} pages.")
+    print(f"-> Finished pagination crawl for {base_url} after checking {page-1} pages.")
 
 # =========================
-# Phase 2B: show-more crawl (/api/article-search)
+# Phase 2B: API-Based "Show More" Crawl
 # =========================
 def extract_tag_value_from_category_html(category_url: str, headers: dict) -> Optional[str]:
-
     """
-    Extract 'fox-news/us/xxx' tag value from the category page HTML.
-    We match OffsetManager.offsetData {"fox-news/...": 30} pattern you pasted.
+    Fetches the category page HTML and attempts to extract the required 'tag' value
+    used by the internal /api/article-search endpoint.
+    Looks for patterns like offsetData: {"fox-news/..." : ...}
     """
-    r = requests.get(category_url, headers=headers, timeout=20)
-    r.raise_for_status()
-    html = r.text
+    try:
+        r = requests.get(category_url, headers=headers, timeout=15)
+        r.raise_for_status()
+        html_content = r.text
+    except requests.exceptions.RequestException as e:
+        print(f"   -> Error fetching category page for tag extraction: {e}")
+        return None
 
-    m = TAG_FROM_OFFSETDATA_RE.search(html)
-    if m:
-        return m.group("tag")
+    # Attempt 1: Specific regex matching the known 'offsetData' structure.
+    match = TAG_FROM_OFFSETDATA_RE.search(html_content)
+    if match:
+        return match.group("tag")
 
-    # fallback (looser)
-    m2 = re.search(r'"(fox-news/us/[^"]+)"', html)
-    if m2:
-        return m2.group(1)
+    # Attempt 2: Fallback, looser regex looking for the tag pattern anywhere.
+    match_fallback = re.search(r'"(fox-news/[a-z-]+/[^"]+)"', html_content)
+    if match_fallback:
+        return match_fallback.group(1)
 
     return None
 
-def extract_urls_from_article_search_json(data) -> list[str]:
+def extract_urls_from_article_search_json(data_json) -> list[str]:
     """
-    Robustly extract foxnews URLs from the /api/article-search JSON.
-    Different builds may store URLs under different keys.
+    Recursively traverses the JSON response from the API to find article URLs.
+    This is robust against variations in JSON structure across different site sections.
     """
-    urls = set()
+    found_urls = set()
 
-    def walk(x):
-        if isinstance(x, dict):
-            for k, v in x.items():
-                if k.lower() in {"url", "link", "weburl", "canonical", "canonicalurl"} and isinstance(v, str):
-                    urls.add(v)
-                walk(v)
-        elif isinstance(x, list):
-            for it in x:
-                walk(it)
+    # Potential keys holding URLs in the JSON response
+    url_keys = {"url", "link", "weburl", "canonical", "canonicalurl"}
 
-    walk(data)
+    def recursive_walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key.lower() in url_keys and isinstance(value, str):
+                    found_urls.add(value)
+                # Continue recursion into nested dictionaries or lists
+                elif isinstance(value, (dict, list)):
+                    recursive_walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                recursive_walk(item)
 
-    out = []
-    for u in urls:
-        full = normalize_url(urljoin(FOX_HOME, u))
-        if full.startswith("https://www.foxnews.com/"):
-            out.append(full)
-    return sorted(set(out))
+    recursive_walk(data_json)
+
+    # Normalize and filter found URLs
+    valid_urls = []
+    for u in found_urls:
+        # Ensure absolute URL
+        full_url = normalize_url(urljoin(FOX_HOME, u))
+        # Double-check host
+        if full_url.startswith(FOX_HOME) or full_url.startswith(FOX_HOME.replace("www.", "")):
+             valid_urls.append(full_url)
+
+    return sorted(set(valid_urls))
 
 def deep_crawl_category_with_show_more_api(
     category_url: str,
     rows: list,
     seen_urls: set,
-    size: int = 11,
+    batch_size: int = 11,
     max_steps: int = MAX_SHOWMORE_STEPS,
 ):
     """
-    Use /api/article-search?searchBy=tags&values=...&size=...&from=...
-    offset increases by size each request.
+    Crawls a category by mimicking the "Show More" button behavior via internal API calls.
+    Iterates by increasing the 'from' offset parameter.
     """
     category_url = normalize_category_url(category_url)
 
+    # Step 1: Get the necessary tag value from the page HTML.
     tag_value = extract_tag_value_from_category_html(category_url, headers=HEADERS)
     if not tag_value:
-        print(f"   -> [ShowMore] Could not find tag_value on page, fallback to paging.")
+        print(f"   -> [ShowMore] Failed to extract 'tag_value' from HTML. Falling back to pagination crawl.")
         deep_crawl_category_with_pagination(category_url, rows, seen_urls)
         return
 
-    print(f"-> Starting ShowMore API Crawl: {category_url}")
-    print(f"   -> tag_value = {tag_value}")
+    print(f"-> Starting API-Based 'Show More' Crawl: {category_url}")
+    print(f"   -> Using tag_value: {tag_value}")
 
-    headers = dict(HEADERS)
-    headers["Accept"] = "application/json, text/plain, */*"
-    headers["Referer"] = category_url
+    # Prepare headers for API requests
+    api_headers = dict(HEADERS)
+    api_headers["Accept"] = "application/json, text/plain, */*"
+    api_headers["Referer"] = category_url
+    api_headers["X-Requested-With"] = "XMLHttpRequest" # Often required for internal APIs
 
-    sess = requests.Session()
+    session = requests.Session()
     offset = 0
 
     for step in range(max_steps):
+        # Parameters for the internal search API endpoint
         params = {
             "searchBy": "tags",
             "values": tag_value,
             "excludeBy": "tags",
-            "excludeValues": "",
-            "size": size,
+            "excludeValues": "", # Sometimes needed, sometimes empty is fine
+            "size": batch_size,
             "from": offset,
         }
 
-        r = sess.get(ARTICLE_SEARCH_API, headers=headers, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
+        try:
+            r = session.get(ARTICLE_SEARCH_API, headers=api_headers, params=params, timeout=15)
+            if r.status_code == 404:
+                 print("   -> [ShowMore] API returned 404 (End of results). Stopping.")
+                 break
+            r.raise_for_status()
+            
+            try:
+                data_json = r.json()
+            except ValueError:
+                 print("   -> [ShowMore] Error decoding JSON response. Stopping.")
+                 break
 
-        urls = extract_urls_from_article_search_json(data)
+            # Extract URLs from the JSON response
+            urls_in_batch = extract_urls_from_article_search_json(data_json)
 
-        new = 0
-        for u in urls:
-            if is_good_article(u) and u not in seen_urls:
-                seen_urls.add(u)
-                rows.append({"url": u, "label": "fox"})
-                new += 1
+            new_in_batch = 0
+            for u in urls_in_batch:
+                if is_good_article(u) and u not in seen_urls:
+                    seen_urls.add(u)
+                    rows.append({"url": u, "label": "fox"})
+                    new_in_batch += 1
 
-        print(f"   -> [ShowMore] from={offset} got={len(urls)} new={new} total={len(seen_urls)}")
+            print(f"   -> [ShowMore] Step {step+1}: offset={offset}, fetched={len(urls_in_batch)}, new={new_in_batch}, total seen={len(seen_urls)}")
 
-        if new == 0:
+            # Stop if no new valid articles are returned in a batch.
+            if new_in_batch == 0 and len(urls_in_batch) < batch_size:
+                 print("   -> [ShowMore] No new articles found and batch is small. Stopping.")
+                 break
+
+            # Prepare next offset and pause gently.
+            offset += batch_size
+            time.sleep(SLEEP_S)
+
+        except requests.exceptions.RequestException as e:
+            print(f"   -> [ShowMore] API Request Error at offset {offset}: {e}. Stopping.")
+            break
+        except Exception as e:
+            print(f"   -> [ShowMore] Unexpected Error at offset {offset}: {e}. Stopping.")
             break
 
-        offset += size
-        time.sleep(SLEEP_S)
-
-    print(f"-> Finished ShowMore API crawl: {category_url}")
+    print(f"-> Finished 'Show More' API crawl for {category_url} after {step+1} steps.")
 
 # =========================
-# Router: choose showmore vs paging
+# Crawling Strategy Router
 # =========================
 def deep_crawl_category_smart(category_url: str, rows: list, seen_urls: set):
-    u = normalize_category_url(category_url)
-    if u in SHOW_MORE_CATEGORIES:
-        deep_crawl_category_with_show_more_api(u, rows, seen_urls, size=11)
+    """
+    Determines the appropriate crawling strategy (API-based vs. Pagination) for a given URL.
+    """
+    normalized_url = normalize_category_url(category_url)
+    if normalized_url in SHOW_MORE_CATEGORIES:
+        # Use specific API crawler for known dynamic pages.
+        deep_crawl_category_with_show_more_api(normalized_url, rows, seen_urls, batch_size=11)
     else:
-        deep_crawl_category_with_pagination(u, rows, seen_urls)
+        # Default to standard pagination crawler for other pages.
+        deep_crawl_category_with_pagination(normalized_url, rows, seen_urls)
 
 # =========================
-# Main
+# Main Execution
 # =========================
 def crawl_all_dynamically():
-    # Step 1: discover nav links
+    """
+    Main function to orchestrate the crawling process: discover links, filter targets, and crawl.
+    """
+    # Step 1: Discover navigation links from the homepage.
     category_links = fetch_nav_links()
 
-    # Step 2: filter URLs suitable for crawling
+    # Step 2: Filter discovered URLs to select suitable crawling targets.
     target_urls = {}
+    # Define path prefixes to exclude from crawling.
+    excluded_sections = ("/video", "/ai", "/opinion", "/games", "/person", "/shows")
+    # Define major sections to prioritize for crawling.
+    target_sections = (
+        "/us", "/politics", "/world", "/media", "/entertainment",
+        "/sports", "/lifestyle", "/health", "/category", "/science"
+    )
+
     for nav_name, url in category_links.items():
         path = urlparse(url).path.lower()
 
-        # skip some sections you excluded
-        if path.startswith(("/video", "/ai", "/opinion", "/games")):
+        # Skip explicitly excluded sections.
+        if path.startswith(excluded_sections):
             continue
 
-        # keep these major sections
-        if path.startswith((
-            "/us", "/politics", "/world", "/media", "/entertainment",
-            "/sports", "/lifestyle", "/health", "/category"
-        )):
+        # Keep URLs belonging to targeted major sections.
+        if path.startswith(target_sections):
+            # Use nav name as key to handle potential duplicate URLs under different labels
             target_urls[nav_name] = normalize_category_url(url)
 
-    print(f"--- Phase 2: Starting Crawl on {len(target_urls)} Filtered Categories ---")
+    print(f"--- Phase 2: Starting Deep Crawl on {len(target_urls)} Filtered Categories ---")
 
     rows = []
     seen_urls = set()
 
+    # Iterate through filtered categories and apply smart crawling strategy.
     for category_name, category_url in target_urls.items():
-        print(f"\n[SECTION] Crawling {category_name}...")
+        print(f"\n[SECTION] Crawling '{category_name}' ({category_url})...")
         deep_crawl_category_smart(category_url, rows, seen_urls)
+        time.sleep(SLEEP_S * 2) # Extra pause between major sections
 
+    # Create DataFrame and save results to CSV.
+    # drop_duplicates by URL just in case, though seen_urls set handles most.
     df = pd.DataFrame(rows, columns=["url", "label"]).drop_duplicates(subset=["url"])
-    df.to_csv(OUT_CSV, index=False, encoding="utf-8")
+    
+    try:
+        df.to_csv(OUT_CSV, index=False, encoding="utf-8")
+        print(f"\n--- DONE ---\nSuccessfully saved {len(df)} unique article rows to '{OUT_CSV}'.")
+    except IOError as e:
+         print(f"\n--- ERROR ---\nFailed to save CSV file: {e}")
 
-    print(f"\n--- DONE ---\nSaved a total of {len(df)} unique article rows -> {OUT_CSV}")
     return df
 
 if __name__ == "__main__":
+    # Entry point of the script.
     crawl_all_dynamically()
